@@ -9,6 +9,7 @@ import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyPingEvent;
 import com.velocitypowered.api.event.proxy.ProxyReloadEvent;
+import com.velocitypowered.api.network.HandshakeIntent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.InboundConnection;
@@ -39,7 +40,7 @@ import java.util.regex.Pattern;
 @Plugin(
         id = "hostgate",
         name = "Host Gate",
-        version = "1.1.0",
+        version = "1.2.0",
         description = "Suppresses Minecraft status pings and rejects connections for unlisted hostnames"
 )
 public final class HostGatePlugin {
@@ -69,6 +70,8 @@ public final class HostGatePlugin {
                     + "# Log rejected login attempts and status pings.\n"
                     + "logRejectedConnections = false\n"
                     + "logRejectedPings = false\n"
+                    + "# Log status pings allowed by Host Gate (can be noisy).\n"
+                    + "logAllowedPings = false\n"
                     + "\n"
                     + "# Deny all connections if the configuration cannot be loaded.\n"
                     + "failClosed = true\n";
@@ -196,6 +199,12 @@ public final class HostGatePlugin {
                     false
             );
 
+            boolean logAllowedPings = getBoolean(
+                    config,
+                    "logAllowedPings",
+                    false
+            );
+
             Set<String> exactHosts = new HashSet<>();
             List<Pattern> wildcardPatterns = new ArrayList<>();
 
@@ -228,20 +237,26 @@ public final class HostGatePlugin {
                 }
             }
 
-            int forcedHostCount = proxyServer
+            Set<String> forcedHosts = new HashSet<>();
+            for (String host : proxyServer
                     .getConfiguration()
                     .getForcedHosts()
-                    .size();
+                    .keySet()) {
+                forcedHosts.add(normalizeHost(host));
+            }
+            int forcedHostCount = forcedHosts.size();
 
             policy = new Policy(
                     true,
                     allowOnlyForcedHosts,
                     Set.copyOf(exactHosts),
                     List.copyOf(wildcardPatterns),
+                    Set.copyOf(forcedHosts),
                     rejectMode,
                     disconnectMessage,
                     logRejectedConnections,
-                    logRejectedPings
+                    logRejectedPings,
+                    logAllowedPings
             );
 
             logger.info(
@@ -651,10 +666,9 @@ public final class HostGatePlugin {
     }
 
     private boolean isAllowed(
-            InboundConnection connection
+            InboundConnection connection,
+            Policy current
     ) {
-        Policy current = policy;
-
         if (!current.valid()) {
             return false;
         }
@@ -668,12 +682,7 @@ public final class HostGatePlugin {
                     .getVirtualHost()
                     .map(InetSocketAddress::getHostString)
                     .map(HostGatePlugin::normalizeHost)
-                    .map(host ->
-                            isAllowedHost(
-                                    host,
-                                    current
-                            )
-                    )
+                    .map(current::permits)
                     .orElse(false);
         } catch (RuntimeException e) {
             logger.error(
@@ -684,31 +693,6 @@ public final class HostGatePlugin {
 
             return false;
         }
-    }
-
-    private boolean isAllowedHost(
-            String host,
-            Policy current
-    ) {
-        if (current.exactHosts().contains(host)) {
-            return true;
-        }
-
-        for (Pattern pattern :
-                current.wildcardPatterns()) {
-
-            if (pattern.matcher(host).matches()) {
-                return true;
-            }
-        }
-
-        return proxyServer
-                .getConfiguration()
-                .getForcedHosts()
-                .keySet()
-                .stream()
-                .map(HostGatePlugin::normalizeHost)
-                .anyMatch(host::equals);
     }
 
     private String getConnectionHost(
@@ -869,11 +853,21 @@ public final class HostGatePlugin {
 
     @Subscribe
     public void onPing(ProxyPingEvent event) {
-        if (isAllowed(event.getConnection())) {
+        Policy current = policy;
+        InboundConnection connection = event.getConnection();
+
+        if (isAllowed(connection, current)) {
+            if (current.logAllowedPings()
+                    && connection.getHandshakeIntent()
+                    == HandshakeIntent.STATUS) {
+                logger.info(
+                        "Host Gate allowed status ping from {} using host '{}'",
+                        connection.getRemoteAddress(),
+                        getConnectionHost(connection)
+                );
+            }
             return;
         }
-
-        Policy current = policy;
 
         if (current.logRejectedPings()) {
             logRejected(
@@ -889,11 +883,10 @@ public final class HostGatePlugin {
 
     @Subscribe
     public void onPreLogin(PreLoginEvent event) {
-        if (isAllowed(event.getConnection())) {
+        Policy current = policy;
+        if (isAllowed(event.getConnection(), current)) {
             return;
         }
-
-        Policy current = policy;
 
         if (current.logRejectedConnections()) {
             logRejected(
@@ -1039,19 +1032,37 @@ public final class HostGatePlugin {
             boolean allowOnlyForcedHosts,
             Set<String> exactHosts,
             List<Pattern> wildcardPatterns,
+            Set<String> forcedHosts,
             RejectMode rejectMode,
             String disconnectMessage,
             boolean logRejectedConnections,
-            boolean logRejectedPings
+            boolean logRejectedPings,
+            boolean logAllowedPings
     ) {
+        private boolean permits(String host) {
+            if (exactHosts.contains(host) || forcedHosts.contains(host)) {
+                return true;
+            }
+
+            for (Pattern pattern : wildcardPatterns) {
+                if (pattern.matcher(host).matches()) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static Policy denyAll() {
             return new Policy(
                     false,
                     true,
                     Set.of(),
                     List.of(),
+                    Set.of(),
                     RejectMode.SILENT,
                     "Disconnected",
+                    false,
                     false,
                     false
             );
@@ -1063,8 +1074,10 @@ public final class HostGatePlugin {
                     false,
                     Set.of(),
                     List.of(),
+                    Set.of(),
                     RejectMode.SILENT,
                     "Disconnected",
+                    false,
                     false,
                     false
             );

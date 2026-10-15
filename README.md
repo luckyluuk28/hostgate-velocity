@@ -36,6 +36,16 @@ plugins/hostgate/config.toml
 
 The generated configuration documents all available options.
 
+Set `logAllowedPings = true` in `plugins/hostgate/config.toml` to log status
+pings that Host Gate allows. It defaults to `false` because public pings can
+produce a lot of log entries. This records the decision made by Host Gate;
+another plugin may still change the final response.
+
+Host Gate snapshots normalized Velocity forced hosts when loading its policy,
+so it does not need to scan and normalize that list for each ping or login.
+`/hostgate reload` and `/velocity reload` refresh the snapshot. Existing
+configuration files work without adding the new setting.
+
 Allowed entries can include exact hostnames, exact IPv4/IPv6 addresses, and
 single-level DNS wildcards such as `*.example.com`.
 
