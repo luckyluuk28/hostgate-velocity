@@ -36,10 +36,12 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 @Plugin(
         id = "hostgate",
         name = "Host Gate",
+        authors = "luckyluuk28",
         version = "1.2.0",
         description = "Suppresses Minecraft status pings and rejects connections for unlisted hostnames"
 )
@@ -72,6 +74,13 @@ public final class HostGatePlugin {
                     + "logRejectedPings = false\n"
                     + "# Log status pings allowed by Host Gate (can be noisy).\n"
                     + "logAllowedPings = false\n"
+                    + "\n"
+                    + "# Regexes checked against each complete Host Gate request log line.\n"
+                    + "# If any regex matches, that line is not logged. Use TOML literal\n"
+                    + "# strings (single quotes) to avoid escaping regex backslashes.\n"
+                    + "logFilters = [\n"
+                    + "    # \"^Host Gate rejected ping from .* using host 'matscan'$\"\n"
+                    + "]\n"
                     + "\n"
                     + "# Deny all connections if the configuration cannot be loaded.\n"
                     + "failClosed = true\n";
@@ -205,6 +214,14 @@ public final class HostGatePlugin {
                     false
             );
 
+            List<Pattern> logFilters;
+            try {
+                logFilters = parseLogFilters(config);
+            } catch (IOException e) {
+                logger.warn("Invalid logFilters; request log filters disabled", e);
+                logFilters = List.of();
+            }
+
             Set<String> exactHosts = new HashSet<>();
             List<Pattern> wildcardPatterns = new ArrayList<>();
 
@@ -256,7 +273,8 @@ public final class HostGatePlugin {
                     disconnectMessage,
                     logRejectedConnections,
                     logRejectedPings,
-                    logAllowedPings
+                    logAllowedPings,
+                    logFilters
             );
 
             logger.info(
@@ -382,6 +400,33 @@ public final class HostGatePlugin {
                     "rejectMode must be \"silent\" or \"disconnect\""
             );
         }
+    }
+
+    private static List<Pattern> parseLogFilters(
+            TomlParseResult config
+    ) throws IOException {
+        Object value = config.get("logFilters");
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof TomlArray entries)) {
+            throw new IOException("logFilters must be a TOML array");
+        }
+
+        List<Pattern> patterns = new ArrayList<>();
+        for (int i = 0; i < entries.size(); i++) {
+            Object entry = entries.get(i);
+            if (!(entry instanceof String expression) || expression.isEmpty()) {
+                throw new IOException("logFilters entry " + i
+                        + " must be a nonempty string");
+            }
+            try {
+                patterns.add(Pattern.compile(expression));
+            } catch (PatternSyntaxException e) {
+                throw new IOException("Invalid logFilters entry " + i, e);
+            }
+        }
+        return List.copyOf(patterns);
     }
 
     private static void addHostPattern(
@@ -730,14 +775,25 @@ public final class HostGatePlugin {
 
     private void logRejected(
             String type,
-            InboundConnection connection
+            InboundConnection connection,
+            Policy current
     ) {
-        logger.info(
-                "Host Gate rejected {} from {} using host '{}'",
-                type,
-                connection.getRemoteAddress(),
-                getConnectionHost(connection)
-        );
+        String message = "Host Gate rejected " + type + " from "
+                + connection.getRemoteAddress() + " using host '"
+                + getConnectionHost(connection) + "'";
+        logRequest(message, current);
+    }
+
+    private void logRequest(
+            String message,
+            Policy current
+    ) {
+        for (Pattern pattern : current.logFilters()) {
+            if (pattern.matcher(message).find()) {
+                return;
+            }
+        }
+        logger.info(message);
     }
 
     private boolean closeSilently(
@@ -860,11 +916,9 @@ public final class HostGatePlugin {
             if (current.logAllowedPings()
                     && connection.getHandshakeIntent()
                     == HandshakeIntent.STATUS) {
-                logger.info(
-                        "Host Gate allowed status ping from {} using host '{}'",
-                        connection.getRemoteAddress(),
-                        getConnectionHost(connection)
-                );
+                logRequest("Host Gate allowed status ping from "
+                        + connection.getRemoteAddress() + " using host '"
+                        + getConnectionHost(connection) + "'", current);
             }
             return;
         }
@@ -872,7 +926,8 @@ public final class HostGatePlugin {
         if (current.logRejectedPings()) {
             logRejected(
                     "ping",
-                    event.getConnection()
+                    event.getConnection(),
+                    current
             );
         }
 
@@ -891,7 +946,8 @@ public final class HostGatePlugin {
         if (current.logRejectedConnections()) {
             logRejected(
                     "login",
-                    event.getConnection()
+                    event.getConnection(),
+                    current
             );
         }
 
@@ -1037,7 +1093,8 @@ public final class HostGatePlugin {
             String disconnectMessage,
             boolean logRejectedConnections,
             boolean logRejectedPings,
-            boolean logAllowedPings
+            boolean logAllowedPings,
+            List<Pattern> logFilters
     ) {
         private boolean permits(String host) {
             if (exactHosts.contains(host) || forcedHosts.contains(host)) {
@@ -1064,7 +1121,8 @@ public final class HostGatePlugin {
                     "Disconnected",
                     false,
                     false,
-                    false
+                    false,
+                    List.of()
             );
         }
 
@@ -1079,7 +1137,8 @@ public final class HostGatePlugin {
                     "Disconnected",
                     false,
                     false,
-                    false
+                    false,
+                    List.of()
             );
         }
     }
